@@ -1,18 +1,35 @@
-
-
 # app.py
-# Run: streamlit run app.py
+# Run locally:  streamlit run app.py
 
 import json, joblib, numpy as np, pandas as pd, matplotlib.pyplot as plt
 import streamlit as st
 from pathlib import Path
 from typing import Dict, List
-import base64
-import requests
+import base64, requests
 from io import BytesIO
 import math
 
-# --- plot style ---
+# --------------------------------------------------------------------------------------
+# Load reference CSV for defaults & category options
+# --------------------------------------------------------------------------------------
+DATA_PATH = Path(__file__).with_name("hydraulics_ops_sustainability_dataset.csv")
+df_ref = pd.read_csv(DATA_PATH)
+
+CAT_COLS = ["region","client_type","product_line","material","control_type","sensor_pack","oil_type"]
+for c in CAT_COLS:
+    if c in df_ref.columns:
+        df_ref[c] = df_ref[c].astype("category")
+
+def first_cat(series, fallback=None):
+    try:
+        return series.cat.categories[0]
+    except Exception:
+        vals = series.dropna().unique()
+        return vals[0] if len(vals) else fallback
+
+# --------------------------------------------------------------------------------------
+# Matplotlib style & Streamlit page
+# --------------------------------------------------------------------------------------
 try:
     plt.style.use("seaborn-v0_8")
 except Exception:
@@ -20,28 +37,14 @@ except Exception:
 
 st.set_page_config(page_title="EcoHydra — Green Hydraulics Predictor", layout="wide")
 
-# =======================
-# Tiny helpers
-# =======================
-def _load_metrics():
-    p = Path("artifacts/metrics.json")
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            return None
-    return None
-
+# --------------------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------------------
 def _fmt(x, nd=3):
     try:
         return f"{float(x):.{nd}f}"
     except Exception:
         return "—"
-
-# =======================
-# Theme & header
-# =======================
-THEME_CHOICE = st.selectbox("Theme", ["Auto", "Light", "Dark"], index=0, key="theme_select", label_visibility="collapsed")
 
 def inject_theme(theme: str):
     st.markdown(f"""
@@ -75,19 +78,15 @@ def inject_theme(theme: str):
                background:rgba(34,197,94,.15); border:1px solid var(--border); margin-left:6px; }}
       .stButton>button, .stDownloadButton>button {{ border-radius:10px; border:1px solid var(--border); box-shadow:var(--shadow); }}
     </style>
-    <script>
-      document.documentElement.classList.remove('theme-light','theme-dark');
-      {'document.documentElement.classList.add("theme-dark");' if theme=='Dark' else ('document.documentElement.classList.add("theme-light");' if theme=='Light' else '')}
-    </script>
     """, unsafe_allow_html=True)
 
+THEME_CHOICE = st.selectbox("Theme", ["Auto", "Light", "Dark"], index=0, key="theme_select", label_visibility="collapsed")
 inject_theme(THEME_CHOICE)
 
 st.markdown(
     "**Data:** Powered by [NASA POWER](https://power.larc.nasa.gov/) (T2M, WS10M).",
     help="We use NASA POWER near-surface temperature and wind to ground heat-loss assumptions."
 )
-
 st.markdown("""
 <div class="hero">
   <div>
@@ -101,13 +100,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# =======================
-# Constants & paths
-# =======================
+# --------------------------------------------------------------------------------------
+# Paths & constants (some used by Admin tab / optional training)
+# --------------------------------------------------------------------------------------
 CSV_FILE = "hydraulics_ops_sustainability_dataset.csv"
 ART = Path("artifacts"); ART.mkdir(exist_ok=True)
-MODEL_EFF = ART / "model_efficiency.joblib"
-MODEL_CO2 = ART / "model_co2.joblib"
+MODEL_EFF_ART = ART / "model_efficiency.joblib"   # (optional retrain artifacts)
+MODEL_CO2_ART = ART / "model_co2.joblib"
 FEATS_EFF = ART / "feature_names_efficiency.json"
 FEATS_CO2 = ART / "feature_names_co2.json"
 METRICS = ART / "metrics.json"
@@ -116,93 +115,66 @@ NUM_EFF = ["filtration_rating_micron","oil_change_interval_hours","test_pressure
 CAT_COMMON = ["region","client_type","product_line","material","control_type","sensor_pack","oil_type"]
 NUM_CO2 = ["energy_used_kwh","filtration_rating_micron","test_pressure_bar","test_duration_min","efficiency_pct"]
 
-# =======================
-# Data & model loaders
-# =======================
-@st.cache_data(show_spinner=False)
-def load_reference():
-    df = pd.read_csv(CSV_FILE)
-    for c in CAT_COMMON:
-        if c in df.columns:
-            df[c] = df[c].astype("category")
-    # Minimal schema check
-    required = set(NUM_EFF + NUM_CO2 + CAT_COMMON + ["co2_kg"])
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.warning(f"Dataset missing columns: {missing}")
-    return df
+# --------------------------------------------------------------------------------------
+# Pretrained models: load from repo root (competition-friendly)
+# --------------------------------------------------------------------------------------
+MODEL_EFF = Path(__file__).with_name("hydraulics_eff_model.pkl")
+MODEL_CO2 = Path(__file__).with_name("hydraulics_co2_model.pkl")
 
-@st.cache_resource(show_spinner=False)
-def load_models():
-    if not (MODEL_EFF.exists() and MODEL_CO2.exists()):
-        return None, None
-    eff = joblib.load(MODEL_EFF)
-    co2 = joblib.load(MODEL_CO2)
-    return eff, co2
+try:
+    model_eff = joblib.load(MODEL_EFF)
+    model_co2 = joblib.load(MODEL_CO2)
+    st.success("✅ Pretrained models loaded successfully.")
+except Exception as e:
+    st.error("❌ Models not available. Please ensure hydraulics_eff_model.pkl and hydraulics_co2_model.pkl are in the repo root.")
+    st.error(str(e))
+    st.stop()
 
-@st.cache_resource(show_spinner=False)
-def load_feature_specs():
-    specs = {}
-    if FEATS_EFF.exists():
-        specs["eff"] = json.loads(FEATS_EFF.read_text())
-    if FEATS_CO2.exists():
-        specs["co2"] = json.loads(FEATS_CO2.read_text())
-    return specs
+# --------------------------------------------------------------------------------------
+# Schema-aware prediction helpers (prevent 'columns are missing' errors)
+# --------------------------------------------------------------------------------------
+def _get_feature_schema(trained_model):
+    """Extract numeric & categorical columns (and cat choices) from the pipeline."""
+    pre = trained_model.named_steps["pre"]  # ColumnTransformer
+    num_cols, cat_cols, ohe = [], [], None
+    for name, trans, cols in pre.transformers_:
+        lname = name.lower()
+        if "num" in lname:
+            num_cols = list(cols)
+        if "cat" in lname:
+            cat_cols = list(cols)
+            ohe = pre.named_transformers_.get(name) or pre.named_transformers_.get("cat")
+    cat_choices = {}
+    if getattr(ohe, "categories_", None) is not None:
+        cat_choices = {col: list(cats) for col, cats in zip(cat_cols, ohe.categories_)}
+    return num_cols, cat_cols, cat_choices
 
-def train_models_inline():
-    # safety net for first run if artifacts missing
-    from sklearn.compose import ColumnTransformer
-    from sklearn.impute import SimpleImputer
-    from sklearn.preprocessing import OneHotEncoder
-    from sklearn.pipeline import Pipeline
-    from sklearn.ensemble import HistGradientBoostingRegressor
+def _build_feature_df(row_dict: Dict[str, object], trained_model):
+    """Return a single-row DataFrame with ALL columns required by the pipeline."""
+    num_cols, cat_cols, cat_choices = _get_feature_schema(trained_model)
+    row = {}
+    for c in num_cols:
+        v = row_dict.get(c, 0.0)
+        try:
+            row[c] = float(v)
+        except Exception:
+            row[c] = 0.0
+    for c in cat_cols:
+        v = row_dict.get(c, None)
+        if v is None or v == "":
+            choices = cat_choices.get(c, [])
+            row[c] = choices[0] if choices else ""
+        else:
+            row[c] = str(v)
+    return pd.DataFrame([row], columns=list(num_cols) + list(cat_cols))
 
-    df = load_reference()
+def _predict(trained_model, row_dict: Dict[str, object]):
+    X = _build_feature_df(row_dict, trained_model)
+    return float(trained_model.predict(X)[0])
 
-    def build_pre(numeric: List[str], categorical: List[str]):
-        num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
-        cat_pipe = Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-        ])
-        return ColumnTransformer([
-            ("num", num_pipe, numeric),
-            ("cat", cat_pipe, categorical),
-        ], remainder="drop")
-
-    pre1 = build_pre(NUM_EFF, CAT_COMMON)
-    m1 = Pipeline([
-        ("pre", pre1),
-        ("hgb", HistGradientBoostingRegressor(random_state=42, learning_rate=0.08, max_depth=6, max_iter=400, l2_regularization=0.02, early_stopping=True)),
-    ])
-    X1 = df[NUM_EFF + CAT_COMMON].copy(); y1 = df["efficiency_pct"].copy()
-    m1.fit(X1, y1)
-    joblib.dump(m1, MODEL_EFF)
-    FEATS_EFF.write_text(json.dumps({"numeric": NUM_EFF, "categorical": CAT_COMMON, "target": "efficiency_pct"}, indent=2))
-
-    pre2 = build_pre(NUM_CO2, CAT_COMMON)
-    m2 = Pipeline([
-        ("pre", pre2),
-        ("hgb", HistGradientBoostingRegressor(random_state=42, learning_rate=0.07, max_depth=6, max_iter=450, l2_regularization=0.04, early_stopping=True)),
-    ])
-    X2 = df[NUM_CO2 + CAT_COMMON].copy(); y2 = df["co2_kg"].copy()
-    m2.fit(X2, y2)
-    joblib.dump(m2, MODEL_CO2)
-    FEATS_CO2.write_text(json.dumps({"numeric": NUM_CO2, "categorical": CAT_COMMON, "target": "co2_kg"}, indent=2))
-
-def _predict(pipe, row_dict: Dict[str, object]):
-    X = pd.DataFrame([row_dict])
-    return float(pipe.predict(X)[0])
-
-@st.cache_data(show_spinner=False)
-def cached_metrics():
-    if METRICS.exists():
-        return json.loads(METRICS.read_text())
-    return None
-
-# =======================
-# Header
-# =======================
+# --------------------------------------------------------------------------------------
+# Header & About
+# --------------------------------------------------------------------------------------
 left, right = st.columns([0.8, 0.2])
 with left:
     st.title("EcoHydra — Green Hydraulics Advisor")
@@ -224,45 +196,24 @@ with right:
                 • Baseline vs Upgraded scenarios • Energy/CO₂ deltas • Advisory only • Cite your TechRxiv DOI
             """)
 
-# =======================
-# Load data/models
-# =======================
-# Load pre-trained models instead of training inline
-import joblib
-from pathlib import Path
-import streamlit as st
-
-MODEL_EFF = Path(__file__).with_name("hydraulics_eff_model.pkl")
-MODEL_CO2 = Path(__file__).with_name("hydraulics_co2_model.pkl")
-
-try:
-    model_eff = joblib.load(MODEL_EFF)
-    model_co2 = joblib.load(MODEL_CO2)
-    st.success("✅ Pretrained models loaded successfully.")
-except Exception as e:
-    st.error("❌ Models not available. Please ensure hydraulics_eff_model.pkl and hydraulics_co2_model.pkl are in the repo.")
-    st.error(str(e))
-    st.stop()
-
-# =======================
+# --------------------------------------------------------------------------------------
 # Sidebar inputs
-# =======================
+# --------------------------------------------------------------------------------------
 st.sidebar.header("Configure a Job")
 
 def cat_select(col, key):
-    opts = list(df_ref[col].cat.categories)
-    idx = 0 if len(opts) else 0
-    return st.sidebar.selectbox(col.replace("_"," ").title(), opts, index=idx, key=key)
+    opts = list(df_ref[col].cat.categories) if col in df_ref.columns else []
+    if not opts: opts = ["N/A"]
+    return st.sidebar.selectbox(col.replace("_"," ").title(), opts, index=0, key=key)
 
-# Example defaults (used for Reset)
 EXAMPLE = {
-    "region": df_ref["region"].cat.categories[0],
-    "client_type": df_ref["client_type"].cat.categories[0],
-    "product_line": df_ref["product_line"].cat.categories[0],
-    "material": df_ref["material"].cat.categories[0],
-    "control_type": df_ref["control_type"].cat.categories[0],
-    "sensor_pack": df_ref["sensor_pack"].cat.categories[0],
-    "oil_type": df_ref["oil_type"].cat.categories[0],
+    "region": first_cat(df_ref["region"]),
+    "client_type": first_cat(df_ref["client_type"]),
+    "product_line": first_cat(df_ref["product_line"]),
+    "material": first_cat(df_ref["material"]),
+    "control_type": first_cat(df_ref["control_type"]),
+    "sensor_pack": first_cat(df_ref["sensor_pack"]),
+    "oil_type": first_cat(df_ref["oil_type"]),
     "filtration_rating_micron": int(df_ref["filtration_rating_micron"].median()),
     "oil_change_interval_hours": int(df_ref["oil_change_interval_hours"].median()),
     "test_pressure_bar": int(df_ref["test_pressure_bar"].median()),
@@ -270,13 +221,8 @@ EXAMPLE = {
     "leak_rate_ml_min": float(df_ref["leak_rate_ml_min"].median()),
     "energy_used_kwh": int(df_ref["energy_used_kwh"].median()),
     # Business
-    "electricity_price": 0.12,
-    "discount_rate": 0.10,
-    "capex_per_machine": 8000,
-    "machines": 10,
-    "adoption_rate": 0.60,
-    "cycles_per_year": 200,
-    "maintenance_delta": 0.0
+    "electricity_price": 0.12, "discount_rate": 0.10, "capex_per_machine": 8000,
+    "machines": 10, "adoption_rate": 0.60, "cycles_per_year": 200, "maintenance_delta": 0.0
 }
 
 if st.sidebar.button("🔁 Reset to Example"):
@@ -302,8 +248,7 @@ leak_rate_ml_min          = st.sidebar.number_input("Leak Rate (ml/min)", 0.0, 5
 energy_used_kwh           = st.sidebar.number_input("Planned Energy Used per run (kWh)", 1, 10000, EXAMPLE["energy_used_kwh"], key="energy_used_kwh")
 
 # Business inputs
-st.sidebar.markdown("---")
-st.sidebar.subheader("Business Inputs")
+st.sidebar.markdown("---"); st.sidebar.subheader("Business Inputs")
 electricity_price = st.sidebar.number_input("Electricity price ($/kWh)", 0.01, 2.00, EXAMPLE["electricity_price"], step=0.01, key="electricity_price")
 discount_rate     = st.sidebar.number_input("Discount rate (0–1)", 0.00, 1.00, EXAMPLE["discount_rate"], step=0.01, key="discount_rate")
 capex_per_machine = st.sidebar.number_input("CapEx per upgraded machine ($)", 0, 10_000_000, EXAMPLE["capex_per_machine"], step=100, key="capex_per_machine")
@@ -312,9 +257,9 @@ adoption_rate     = st.sidebar.slider("Adoption rate", 0.0, 1.0, EXAMPLE["adopti
 cycles_per_year   = st.sidebar.number_input("Operating runs per year", 1, 100000, EXAMPLE["cycles_per_year"], key="cycles_per_year")
 maintenance_delta = st.sidebar.number_input("Maintenance Δ per machine ($/yr)", -100000.0, 100000.0, EXAMPLE["maintenance_delta"], step=100.0, key="maintenance_delta")
 
-# =======================
-# Baseline/Upgraded dicts
-# =======================
+# --------------------------------------------------------------------------------------
+# Baseline / upgraded configs
+# --------------------------------------------------------------------------------------
 baseline = dict(
     region=region, client_type=client_type, product_line=product_line, material=material,
     control_type=control_type, sensor_pack=sensor_pack, oil_type=oil_type,
@@ -348,9 +293,9 @@ def smart_upgrade(b: Dict[str, object]) -> Dict[str, object]:
 
 upgraded = smart_upgrade(baseline)
 
-# =======================
-# Predictions & deltas
-# =======================
+# --------------------------------------------------------------------------------------
+# Predictions & deltas (schema-aware)
+# --------------------------------------------------------------------------------------
 eff_base = _predict(model_eff, {
     'filtration_rating_micron': baseline['filtration_rating_micron'],
     'oil_change_interval_hours': baseline['oil_change_interval_hours'],
@@ -371,7 +316,6 @@ eff_up = _predict(model_eff, {
     'material': upgraded['material'], 'control_type': upgraded['control_type'], 'sensor_pack': upgraded['sensor_pack'], 'oil_type': upgraded['oil_type'],
 })
 
-# CO2: constant input vs same useful output
 co2_base_const = _predict(model_co2, {
     'energy_used_kwh': baseline['energy_used_kwh'],
     'filtration_rating_micron': baseline['filtration_rating_micron'],
@@ -409,44 +353,27 @@ waste_base     = baseline['energy_used_kwh']       * (1 - eff_base/100.0)
 waste_up_const = baseline['energy_used_kwh']       * (1 - eff_up/100.0)
 waste_up_same  = adj_energy_same_output            * (1 - eff_up/100.0)
 
-# =======================
+# --------------------------------------------------------------------------------------
 # KPIs
-# =======================
+# --------------------------------------------------------------------------------------
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.markdown(f'<div class="kpi"><h3>Baseline Efficiency</h3><div>{eff_base:.1f}%</div></div>', unsafe_allow_html=True)
 with c2: st.markdown(f'<div class="kpi"><h3>Upgraded Efficiency</h3><div>{eff_up-eff_base:+.1f}% → {eff_up:.1f}%</div></div>', unsafe_allow_html=True)
 with c3: st.markdown(f'<div class="kpi"><h3>CO₂ (Const. Input)</h3><div>{co2_base_const:.2f} → {co2_up_const:.2f} kg</div></div>', unsafe_allow_html=True)
 with c4: st.markdown(f'<div class="kpi"><h3>CO₂ (Same Output)</h3><div>{co2_base_const:.2f} → {co2_up_same_output:.2f} kg</div></div>', unsafe_allow_html=True)
 
-_m = _load_metrics()
-if _m:
-    eff_t = _m.get("efficiency", {}).get("test", {})
-    co2_t = _m.get("co2", {}).get("test", {})
-    st.markdown(
-        f"""
-        <div style="display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:12px; margin:.25rem 0 1rem;">
-          <div class="kpi"><h3>Eff R² (test)</h3><div>{_fmt(eff_t.get('r2'))}</div></div>
-          <div class="kpi"><h3>Eff MAE</h3><div>{_fmt(eff_t.get('mae'))}</div></div>
-          <div class="kpi"><h3>CO₂ R² (test)</h3><div>{_fmt(co2_t.get('r2'))}</div></div>
-          <div class="kpi"><h3>CO₂ MAE</h3><div>{_fmt(co2_t.get('mae'))}</div></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.info("Train first to see metrics badges (run `python hydraulics.py`).")
 st.markdown("<span class='muted'>‘Same output’ normalizes useful work: input energy scales by baseline vs upgraded efficiency.</span>", unsafe_allow_html=True)
 
-# =======================
+# --------------------------------------------------------------------------------------
 # Tabs
-# =======================
+# --------------------------------------------------------------------------------------
 TAB1, TAB2, TAB3, TAB4, TAB5, TAB6 = st.tabs(
     ["Scenario Comparison", "Past Data", "Recommendations", "Admin", "Research Paper", "How to Use"]
 )
 
-# ---- NASA climate context (always visible) ----
+# ---- NASA climate context (fixed params handling) ----
 st.subheader("NASA Climate Context (POWER)")
-lat = st.number_input("Latitude", -90.0, 90.0, 29.76)     # Houston example
+lat = st.number_input("Latitude", -90.0, 90.0, 29.76)
 lon = st.number_input("Longitude", -180.0, 180.0, -95.37)
 year = st.number_input("Year", 2000, 2100, 2025)
 params = {
@@ -455,11 +382,11 @@ params = {
     "end":   f"{year}1231",
     "latitude": lat,
     "longitude": lon,
+    "community": "RE",
     "format": "JSON",
 }
-url = "https://power.larc.nasa.gov/api/temporal/daily/point?parameters=T2M,WS10M&start=20240101&end=20241231&latitude=29.76&longitude=-95.38&community=RE&format=JSON"
 try:
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get("https://power.larc.nasa.gov/api/temporal/daily/point", params=params, timeout=20)
     r.raise_for_status()
     j = r.json()
     days = j["properties"]["parameter"]["T2M"].keys()
@@ -498,8 +425,6 @@ with TAB1:
 
     # ---- Business View KPIs ----
     st.subheader("Business View")
-
-    # Annualize per machine
     baseline_kwh_per_machine_year = float(baseline['energy_used_kwh']) * cycles_per_year
     upgraded_kwh_per_machine_year = float(adj_energy_same_output) * cycles_per_year
     delta_kwh_per_machine_year = max(baseline_kwh_per_machine_year - upgraded_kwh_per_machine_year, 0.0)
@@ -530,13 +455,11 @@ with TAB1:
     payback_months = (12 * total_capex / fleet_annual_savings) if fleet_annual_savings > 0 else float("inf")
 
     cA, cB, cC, cD = st.columns(4)
-    with cA:
-        st.markdown(f'<div class="kpi"><h3>Annual $ Savings</h3><div>${fleet_annual_savings:,.0f}</div></div>', unsafe_allow_html=True)
+    with cA: st.markdown(f'<div class="kpi"><h3>Annual $ Savings</h3><div>${fleet_annual_savings:,.0f}</div></div>', unsafe_allow_html=True)
     with cB:
         pb_txt = "—" if not math.isfinite(payback_months) else f"{payback_months:.1f} mo"
         st.markdown(f'<div class="kpi"><h3>Payback</h3><div>{pb_txt}</div></div>', unsafe_allow_html=True)
-    with cC:
-        st.markdown(f'<div class="kpi"><h3>NPV (5y, {discount_rate:.0%})</h3><div>${proj_npv:,.0f}</div></div>', unsafe_allow_html=True)
+    with cC: st.markdown(f'<div class="kpi"><h3>NPV (5y, {discount_rate:.0%})</h3><div>${proj_npv:,.0f}</div></div>', unsafe_allow_html=True)
     with cD:
         irr_txt = "—" if proj_irr is None else f"{proj_irr:.1%}"
         st.markdown(f'<div class="kpi"><h3>IRR (5y)</h3><div>{irr_txt}</div></div>', unsafe_allow_html=True)
@@ -556,7 +479,6 @@ with TAB1:
     # ---- ExecutiveSummary.xlsx export ----
     def build_exec_summary_excel() -> BytesIO | None:
         try:
-            # Use openpyxl if available for formulas; fallback to pandas/xlsxwriter if not.
             from openpyxl import Workbook
             wb = Workbook()
             ws = wb.active; ws.title = "Assumptions"
@@ -576,7 +498,6 @@ with TAB1:
                 ("Maintenance Δ per machine ($/yr)", maintenance_delta),
             ]
             for r in rows: ws.append(list(r))
-
             ws2 = wb.create_sheet("Savings")
             ws2.append(["Metric", "Value"])
             ws2.append(["Annual savings per machine ($/yr)", delta_kwh_per_machine_year * electricity_price + maintenance_delta])
@@ -584,7 +505,6 @@ with TAB1:
             ws2.append(["Fleet annual savings ($/yr)", fleet_annual_savings])
             ws2.append(["Total CapEx ($)", total_capex])
             ws2.append(["Simple payback (months)", None if not math.isfinite(payback_months) else payback_months])
-
             ws3 = wb.create_sheet("Finance")
             ws3.append(["Year", "Cash Flow ($)"])
             ws3.append([0, -total_capex])
@@ -592,15 +512,12 @@ with TAB1:
             ws3["E1"] = "Discount rate"; ws3["F1"] = discount_rate
             ws3["E2"] = "NPV"; ws3["F2"] = f"=NPV(F1,B3:B{2+horizon_years})+B2"
             ws3["E3"] = "IRR"; ws3["F3"] = f"=IRR(B2:B{2+horizon_years})"
-
             ws4 = wb.create_sheet("Scenarios")
             ws4.append(["Scenario", "Efficiency (%)", "Energy (kWh/run)"])
             ws4.append(["Baseline", eff_base/100.0, float(baseline['energy_used_kwh'])])
             ws4.append(["Upgraded (same output)", eff_up/100.0, float(adj_energy_same_output)])
-
             bio = BytesIO(); wb.save(bio); bio.seek(0); return bio
         except Exception:
-            # Fallback simple CSV-in-zip if Excel libs missing
             try:
                 import zipfile, io
                 zip_buf = io.BytesIO()
@@ -620,8 +537,7 @@ with TAB1:
                                   (None if not math.isfinite(payback_months) else payback_months)]
                     })
                     z.writestr("Savings.csv", sav.to_csv(index=False))
-                zip_buf.seek(0)
-                return zip_buf
+                zip_buf.seek(0); return zip_buf
             except Exception:
                 return None
 
@@ -691,7 +607,6 @@ with TAB3:
     try_change("Switch to Servo/Proportional Control", lambda d: {**d, "control_type": upgraded["control_type"]})
     try_change("Use Biodegradable Oil", lambda d: {**d, "oil_type": upgraded["oil_type"]})
     try_change("Finer Filtration (−30%)", lambda d: {**d, "filtration_rating_micron": max(3, int(round(d["filtration_rating_micron"]*0.7)))})
-
     if str(baseline.get("material"," ")).lower() in {"steel","carbon steel"}:
         try_change("Lighter Material (Composite/Aluminum)", lambda d: {**d, "material": upgraded["material"]})
 
@@ -708,38 +623,28 @@ with TAB4:
     st.subheader("Admin & Citation")
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        if st.button("Re-train models now"):
-            with st.spinner("Training models…"):
-                train_models_inline()
-                st.success("Models retrained. Refresh the page.")
+        st.caption("Optional: retrain artifacts locally")
+        st.code("python hydraulics.py  # writes artifacts/ and metrics.json")
     with col2:
         have_csv = Path(CSV_FILE).exists()
         st.write(f"CSV detected: **{have_csv}** → `{CSV_FILE}`")
-        st.write(f"Models present: **{MODEL_EFF.exists() and MODEL_CO2.exists()}**")
+        st.write(f"Pretrained models present: **{MODEL_EFF.exists() and MODEL_CO2.exists()}**")
         if METRICS.exists():
             st.write("Metrics file:", str(METRICS))
     with col3:
         st.write("**Cite** (replace with your DOI):")
-        st.code("Preprint: Data-Driven Sustainability Optimization in Hydraulic Systems — IEEE TechRxiv (DOI: 10.xxxx/techrxiv.xxxxx)")
-
-    st.markdown("---")
-    m = cached_metrics()
-    if m:
-        st.caption("Holdout + 5-fold CV metrics (from training script).")
-        st.json(m)
+        st.code("Ghayal, A. (2025). Data-Driven Sustainability Optimization in Hydraulic Systems. IEEE TechRxiv. DOI: 10.xxxx/techrxiv.xxxxx")
 
 with TAB5:
     st.subheader("Project Paper")
-    DOI = "10.5281/zenodo.16879329"  # 🔁 EDIT THIS
+    DOI = "10.5281/zenodo.16879329"  # 🔁 EDIT
     PAPER_URL = "https://zenodo.org/records/16879329"
     st.link_button("Open on CERN's Zenodo", PAPER_URL)
-
     st.markdown("**How to cite**")
     st.code(
         f"Ghayal, A. (2025). Data-Driven Sustainability Optimization in Hydraulic Systems: "
         f"Efficiency, Emissions, and Material Innovations. IEEE TechRxiv. https://doi.org/{DOI}"
     )
-
     st.divider()
     st.markdown("**Inline PDF (optional)**")
     candidates = [Path("docs/preprint.pdf"), Path("docs/TechRxiv_Preprint.pdf"), Path("paper.pdf")]
@@ -751,8 +656,7 @@ with TAB5:
             st.markdown(
                 f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="900" type="application/pdf"></iframe>',
                 unsafe_allow_html=True,
-            )
-            break
+            ); break
     else:
         st.info("Place your paper at **docs/preprint.pdf** (or `paper.pdf`) to embed it here.")
 
@@ -766,9 +670,9 @@ with TAB6:
     5. See **Recommendations** for the single highest-impact change.
     """)
 
-# =======================
-# Footers
-# =======================
+# --------------------------------------------------------------------------------------
+# Footer
+# --------------------------------------------------------------------------------------
 st.markdown("""
 ---
 <span class='subtle'>Disclaimer: This tool provides decision support and estimates. It is **not** a safety interlock. Validate changes locally and ensure compliance with manufacturer guidance and ISO standards.</span>
@@ -777,3 +681,4 @@ st.markdown(
     "<hr/><span class='caption'>Limitations: Estimates only; assumptions are user-editable. No PII is collected. NASA POWER data used under its terms.</span>",
     unsafe_allow_html=True
 )
+
