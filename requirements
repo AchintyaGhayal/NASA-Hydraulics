@@ -1,9 +1,12 @@
 streamlit>=1.36
-pandas>=2.1
+pandas>=2.2
 numpy>=1.26
 matplotlib>=3.8
 scikit-learn>=1.4
 joblib>=1.3
-requests>=2.31
-openpyxl>=3.1.2     # enables Excel export with formulas
-xlsxwriter>=3.2.0   # optional; safe to include
+requests>=2.32
+python-dotenv>=1.0
+plotly>=5.22
+xgboost>=2.0
+lightgbm>=4.3
+pillow>=10.3
