@@ -637,28 +637,39 @@ with TAB4:
 
 with TAB5:
     st.subheader("Project Paper")
-    DOI = "10.5281/zenodo.16879329"  # 🔁 EDIT
+    DOI = "10.5281/zenodo.16879329"  # 🔁 EDIT this to your actual DOI
     PAPER_URL = "https://zenodo.org/records/16879329"
     st.link_button("Open on CERN's Zenodo", PAPER_URL)
+
     st.markdown("**How to cite**")
     st.code(
         f"Ghayal, A. (2025). Data-Driven Sustainability Optimization in Hydraulic Systems: "
         f"Efficiency, Emissions, and Material Innovations. IEEE TechRxiv. https://doi.org/{DOI}"
     )
+
     st.divider()
-    st.markdown("**Inline PDF (optional)**")
-    candidates = [Path("docs/preprint.pdf"), Path("docs/TechRxiv_Preprint.pdf"), Path("paper.pdf")]
-    for p in candidates:
-        if p.exists():
-            data = p.read_bytes()
-            st.download_button("Download PDF", data=data, file_name=p.name, mime="application/pdf")
-            b64 = base64.b64encode(data).decode()
+    st.markdown("**Research Paper (inline PDF)**")
+
+    try:
+        with open("paper.pdf", "rb") as f:   # 👈 your file
+            data = f.read()
+            b64 = base64.b64encode(data).decode("utf-8")
+
+            # Download button
+            st.download_button(
+                "Download Research Paper (PDF)",
+                data=data,
+                file_name="paper.pdf",
+                mime="application/pdf"
+            )
+
+            # Inline embed
             st.markdown(
                 f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="900" type="application/pdf"></iframe>',
                 unsafe_allow_html=True,
-            ); break
-    else:
-        st.info("Place your paper at **docs/preprint.pdf** (or `paper.pdf`) to embed it here.")
+            )
+    except FileNotFoundError:
+        st.info("Place your research paper at `paper.pdf` to embed it here.")
 
 with TAB6:
     st.subheader("How to Use")
