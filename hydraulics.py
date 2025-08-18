@@ -17,6 +17,22 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 
+DATA_PATH = Path(__file__).with_name("hydraulics_ops_sustainability_dataset.csv")
+df_ref = pd.read_csv(DATA_PATH)
+
+# ensure categorical dtypes so .cat.categories works
+CAT_COLS = ["region","client_type","product_line","material",
+            "control_type","sensor_pack","oil_type"]
+for c in CAT_COLS:
+    if c in df_ref.columns:
+        df_ref[c] = df_ref[c].astype("category")
+
+def first_cat(series, fallback=None):
+    try:
+        return series.cat.categories[0]
+    except Exception:
+        vals = series.dropna().unique()
+        return vals[0] if len(vals) else fallback
 warnings.filterwarnings("ignore")
 
 CSV_FILE = "hydraulics_ops_sustainability_dataset.csv"
